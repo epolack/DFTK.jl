@@ -14,7 +14,7 @@ a = 5.42352  # Bohr
 lattice = a / 2 * [[-1  1  1];
                    [ 1 -1  1];
                    [ 1  1 -1]]
-atoms     = [ElementPsp(:Fe, psp=load_psp("hgh/lda/Fe-q8.hgh"))]
+atoms     = [ElementPsp(:Fe; psp=load_psp("hgh/lda/Fe-q8.hgh"))]
 positions = [zeros(3)];
 
 # To get the ground-state energy we use an LDA model and rather moderate
@@ -39,7 +39,7 @@ scfres_nospin.energies
 # electrons at each centre to the `Model` and the guess density functions.
 # In this case we seek the state with as many spin-parallel
 # ``d``-electrons as possible. In our pseudopotential model the 8 valence
-# electrons are 2 pair of ``s``-electrons, 1 pair of ``d``-electrons
+# electrons are 1 pair of ``s``-electrons, 1 pair of ``d``-electrons
 # and 4 unpaired ``d``-electrons giving a desired magnetic moment of `4` at the iron centre.
 # The structure (i.e. pair mapping and order) of the `magnetic_moments` array needs to agree
 # with the `atoms` array and `0` magnetic moments need to be specified as well.
@@ -59,7 +59,7 @@ magnetic_moments = [4];
 model = model_LDA(lattice, atoms, positions; magnetic_moments, temperature=0.01)
 basis = PlaneWaveBasis(model; Ecut, kgrid)
 ρ0 = guess_density(basis, magnetic_moments)
-scfres = self_consistent_field(basis, tol=1e-4; ρ=ρ0, mixing=KerkerDosMixing());
+scfres = self_consistent_field(basis, tol=1e-6; ρ=ρ0, mixing=KerkerDosMixing());
 #-
 scfres.energies
 
@@ -101,11 +101,14 @@ idown = iup + length(scfres.basis.kpoints) ÷ 2
 
 # We can observe the spin-polarization by looking at the density of states (DOS)
 # around the Fermi level, where the spin-up and spin-down DOS differ.
-
 using Plots
-plot_dos(scfres)
+bands_666 = compute_bands(scfres, MonkhorstPack(6, 6, 6))  # Increase kgrid to get nicer DOS.
+plot_dos(bands_666)
+# Note that if same k-grid as SCF should be employed, a simple `plot_dos(scfres)`
+# is sufficient.
 
 # Similarly the band structure shows clear differences between both spin components.
 using Unitful
 using UnitfulAtomic
-plot_bandstructure(scfres; kline_density=6)
+bands_kpath = compute_bands(scfres; kline_density=6)
+plot_bandstructure(bands_kpath)

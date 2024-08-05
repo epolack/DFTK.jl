@@ -35,14 +35,16 @@
 
 
 ## TODO micro-optimization of buffer reuse
-## TODO write a version that doesn't assume that B is well-conditionned, and doesn't reuse B applications at all
-## TODO it seems there is a lack of orthogonalization immediately after locking, maybe investigate this to save on some choleskys
+## TODO write a version that doesn't assume that B is well-conditioned, and doesn't reuse B applications at all
+## TODO it seems there is a lack of orthogonalization immediately after locking, maybe investigate this to save on some Choleskys
 ## TODO debug orthogonalizations when A=I
 
+# TODO Use @debug for this
 # vprintln(args...) = println(args...)  # Uncomment for output
 vprintln(args...) = nothing
 
 using LinearAlgebra
+import LinearAlgebra: BlasFloat
 import Base: *
 import Base.size, Base.adjoint, Base.Array
 
@@ -54,7 +56,7 @@ involving this structure will always yield a plain array (and not a LazyHcat str
 LazyHcat is a lightweight subset of BlockArrays.jl's functionalities, but has the
 advantage to be able to store GPU Arrays (BlockArrays is heavily built on Julia's CPU Array).
 """
-struct LazyHcat{T <: Number, D <: Tuple} <: AbstractMatrix{T}
+struct LazyHcat{T<:Number, D<:Tuple} <: AbstractMatrix{T}
     blocks::D
 end
 
@@ -71,23 +73,23 @@ end
 function Base.size(A::LazyHcat)
     n = size(A.blocks[1], 1)
     m = sum(size(block, 2) for block in A.blocks)
-    (n,m)
+    (n, m)
 end
 
-Base.Array(A::LazyHcat)  = hcat(A.blocks...)
+Base.Array(A::LazyHcat) = stack(A.blocks)
 
 Base.adjoint(A::LazyHcat) = Adjoint(A)
 
-@views function Base.:*(Aadj::Adjoint{T, <: LazyHcat}, B::LazyHcat) where {T}
+@views function Base.:*(Aadj::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}
     A = Aadj.parent
     rows = size(A)[2]
     cols = size(B)[2]
     ret = similar(A.blocks[1], rows, cols)
 
     orow = 0  # row offset
-    for (iA, blA) in enumerate(A.blocks)
+    for blA in A.blocks
         ocol = 0  # column offset
-        for (iB, blB) in enumerate(B.blocks)
+        for blB in B.blocks
             ret[orow .+ (1:size(blA, 2)), ocol .+ (1:size(blB, 2))] .= blA' * blB
             ocol += size(blB, 2)
         end
@@ -96,7 +98,7 @@ Base.adjoint(A::LazyHcat) = Adjoint(A)
     ret
 end
 
-Base.:*(Aadj::Adjoint{T, <: LazyHcat}, B::AbstractMatrix) where {T} = Aadj * LazyHcat(B)
+Base.:*(Aadj::Adjoint{T,<:LazyHcat}, B::AbstractMatrix) where {T} = Aadj * LazyHcat(B)
 
 @views function *(Ablock::LazyHcat, B::AbstractMatrix)
     res = Ablock.blocks[1] * B[1:size(Ablock.blocks[1], 2), :]  # First multiplication
@@ -116,9 +118,29 @@ end
 # Perform a Rayleigh-Ritz for the N first eigenvectors.
 @timing function rayleigh_ritz(X, AX, N)
     XAX = X' * AX
-    @assert all(!isnan, XAX)
-    F = eigen(Hermitian(XAX))
-    F.vectors[:,1:N], F.values[1:N]
+    @assert !any(isnan, XAX)
+    rayleigh_ritz(Hermitian(XAX), N)
+end
+@views function rayleigh_ritz(XAX::Hermitian, N)
+    # Fallback: Use whatever is the default dense eigensolver.
+    # Note: GenericLinearAlgebra uses a QR-based algorithm, which is pretty safe in terms
+    #       of keeping the vectors orthogonal
+    values, vectors = eigen(XAX)
+    vectors[:, 1:N], values[1:N]
+end
+@views function rayleigh_ritz(XAX::Hermitian{<:BlasFloat, <:Array}, N)
+    # LAPACK sysevr (the Julia default dense eigensolver) can actually return eigenvectors
+    # that are significantly non-orthogonal (1e-4 in Float32 in some tests) here,
+    # presumably because it tries hard to make them eigenvectors in the presence
+    # of small gaps. Since we care more about them being orthogonal
+    # than about them being eigenvectors, re-orthogonalize.
+    # TODO To avoid orthogonalization: Use syevd,
+    # which does a much better job, see https://github.com/JuliaLang/julia/pull/49262
+    # and https://github.com/JuliaLang/julia/pull/49355
+    values, vectors = eigen(XAX)
+    v = vectors[:, 1:N]
+    ortho!(v)
+    v, values[1:N]
 end
 
 # B-orthogonalize X (in place) using only one B apply.
@@ -129,7 +151,7 @@ end
 function B_ortho!(X, BX)
     O = Hermitian(X'*BX)
     U = cholesky(O).U
-    @assert all(!isnan, U)
+    @assert !any(isnan, U)
     rdiv!(X, U)
     rdiv!(BX, U)
 end
@@ -146,7 +168,7 @@ normest(M) = maximum(abs.(diag(M))) + norm(M - Diagonal(diag(M)))
     # U,S,V = svd(X)
     # return U*V', 1, 1
 
-    growth_factor = 1
+    growth_factor = one(real(T))
 
     success = false
     nchol = 0
@@ -182,7 +204,7 @@ normest(M) = maximum(abs.(diag(M))) + norm(M - Diagonal(diag(M)))
             success = false
         end
         invR = inv(R)
-        @assert all(!isnan, invR)
+        @assert !any(isnan, invR)
         rmul!(X, invR)  # we do not use X/R because we use invR next
 
         # We would like growth_factor *= opnorm(inv(R)) but it's too
@@ -209,7 +231,7 @@ normest(M) = maximum(abs.(diag(M))) + norm(M - Diagonal(diag(M)))
 
     # @assert norm(X'X - I) < tol
 
-    X, nchol, growth_factor
+    (; X, nchol, growth_factor)
 end
 
 # Randomize the columns of X if the norm is below tol
@@ -228,7 +250,7 @@ end
 # Find X that is orthogonal, and B-orthogonal to Y, up to a tolerance tol.
 @timing "ortho! X vs Y" function ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T))) where {T}
     # normalize to try to cheaply improve conditioning
-    Threads.@threads for i=1:size(X,2)
+    parallel_loop_over_range(1:size(X, 2)) do i
         n = norm(@views X[:,i])
         @views X[:,i] ./= n
     end
@@ -262,7 +284,7 @@ end
 
         # If we're at a fixed point, growth_factor is 1 and if tol >
         # eps(), the loop will terminate, even if BY'Y != 0
-        growth_factor*eps(real(T)) < tol && break
+        growth_factor * eps(real(T)) < tol && break
 
         niter > 10 && error("Ortho(X,Y) is failing badly, this should never happen")
         niter += 1
@@ -276,11 +298,21 @@ end
 end
 
 
-function final_retval(X, AX, resid_history, niter, n_matvec)
-    λ = real(diag(X' * AX))
-    residuals = AX .- X*Diagonal(λ)
-    (; λ, X,
-     residual_norms=[norm(residuals[:, i]) for i in 1:size(residuals, 2)],
+function final_retval(X, AX, BX, resid_history, niter, n_matvec)
+    λ = @views [real((X[:, n]'*AX[:, n]) / (X[:, n]'BX[:, n])) for n=1:size(X, 2)]
+    λ_device = oftype(X[:, 1], λ)  # Offload to GPU if needed
+    residuals = AX .- BX .* λ_device'
+    if !issorted(λ)
+        p = sortperm(λ)
+        λ = λ[p]
+        residuals = residuals[:, p]
+        X  = X[:, p]
+        AX = AX[:, p]
+        BX = BX[:, p]
+        resid_history = resid_history[p, :]
+    end
+    (; λ=λ_device, X, AX, BX,
+     residual_norms=norm.(eachcol(residuals)),
      residual_history=resid_history[:, 1:niter+1], n_matvec)
 end
 
@@ -316,7 +348,7 @@ end
     n_matvec = M  # Count number of matrix-vector products
     AX = similar(X)
     AX = mul!(AX, A, X)
-    @assert all(!isnan, AX)
+    @assert !any(isnan, AX)
     # full_X/AX/BX will always store the full (including locked) X.
     # X/AX/BX only point to the active part
     P = zero(X)
@@ -335,12 +367,13 @@ end
     end
     nlocked = 0
     niter = 0  # the first iteration is fake
-    λs = @views [(X[:, n]'*AX[:, n]) / (X[:, n]'BX[:, n]) for n=1:M]
+    λs = @views [real((X[:, n]'*AX[:, n]) / (X[:, n]'BX[:, n])) for n=1:M]
     λs = oftype(X[:, 1], λs)  # Offload to GPU if needed
-    new_X = X
+    new_X  = X
     new_AX = AX
     new_BX = BX
-    full_X = X
+    # The full_ arrays contain all the vectors, the others only get the active ones
+    full_X  = X
     full_AX = AX
     full_BX = BX
 
@@ -372,14 +405,17 @@ end
         end
 
         ### Compute new residuals
-        new_R = new_AX .- new_BX .* λs'
+        @timing "Update residuals" begin
+            new_R = new_AX .- new_BX .* λs'
+            @views for i = 1:size(X, 2)
+                resid_history[i + nlocked, niter+1] = norm(new_R[:, i])
+            end
+        end
+        vprintln(niter, "   ", resid_history[:, niter+1])
+
         # it is actually a good question of knowing when to
         # precondition. Here seems sensible, but it could plausibly be
         # done before or after
-        @views for i=1:size(X,2)
-            resid_history[i + nlocked, niter+1] = norm(new_R[:, i])
-        end
-        vprintln(niter, "   ", resid_history[:, niter+1])
         if precon !== I
             @timing "preconditioning" begin
                 precondprep!(precon, X)  # update preconditioner if needed; defaults to noop
@@ -410,7 +446,7 @@ end
         if nlocked >= n_conv_check  # Converged!
             X .= new_X  # Update the part of X which is still active
             AX .= new_AX
-            return final_retval(full_X, full_AX, resid_history, niter, n_matvec)
+            return final_retval(full_X, full_AX, full_BX, resid_history, niter, n_matvec)
         end
         newly_locked = nlocked - prev_nlocked
         active = newly_locked+1:size(X,2)  # newly active vectors
@@ -499,5 +535,5 @@ end
         niter = niter + 1
     end
 
-    final_retval(full_X, full_AX, resid_history, maxiter, n_matvec)
+    final_retval(full_X, full_AX, full_BX, resid_history, maxiter, n_matvec)
 end

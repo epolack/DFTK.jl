@@ -7,7 +7,7 @@ function parse_system(system::AbstractSystem{D}) where {D}
     end
 
     # Parse abstract system and return data required to construct model
-    mtx = austrip.(reduce(hcat, bounding_box(system)))
+    mtx = austrip.(stack(bounding_box(system)))
     T = eltype(mtx)
     lattice = zeros(T, 3, 3)
     lattice[1:D, 1:D] .= mtx
@@ -17,12 +17,16 @@ function parse_system(system::AbstractSystem{D}) where {D}
     # to deduce the atom_groups.
     cached_pspelements = Dict{String, ElementPsp}()
     atoms = map(system) do atom
-        if hasproperty(atom, :pseudopotential) && !isempty(atom.pseudopotential)
-            get!(cached_pspelements, atom.pseudopotential) do
-                ElementPsp(atomic_symbol(atom); psp=load_psp(atom.pseudopotential))
-            end
+        pseudo = get(atom, :pseudopotential, "")
+        if isempty(pseudo)
+            ElementCoulomb(atomic_number(atom); mass=atomic_mass(atom))
         else
-            ElementCoulomb(atomic_symbol(atom))
+            key = pseudo * string(atomic_mass(atom))
+            get!(cached_pspelements, key) do
+                kwargs = get(atom, :pseudopotential_kwargs, ())
+                ElementPsp(atomic_number(atom); psp=load_psp(pseudo; kwargs...),
+                           mass=atomic_mass(atom))
+            end
         end
     end
 
@@ -33,8 +37,7 @@ function parse_system(system::AbstractSystem{D}) where {D}
     end
 
     magnetic_moments = map(system) do atom
-        hasproperty(atom, :magnetic_moment) || return nothing
-        getproperty(atom, :magnetic_moment)
+        get(atom, :magnetic_moment, nothing)
     end
     if all(m -> isnothing(m) || iszero(m) || isempty(m), magnetic_moments)
         empty!(magnetic_moments)
@@ -42,22 +45,17 @@ function parse_system(system::AbstractSystem{D}) where {D}
         magnetic_moments = normalize_magnetic_moment.(magnetic_moments)
     end
 
-    sum_atomic_charge = sum(system) do atom
-        hasproperty(atom, :charge) ? atom.charge : 0.0u"e_au"
-    end
+    sum_atomic_charge = sum(atom -> get(atom, :charge, 0.0u"e_au"), system; init=0.0u"e_au")
     if abs(sum_atomic_charge) > 1e-6u"e_au"
         error("Charged systems not yet supported in DFTK.")
     end
 
-    # TODO Use system to determine n_electrons
-    if system isa FlexibleSystem
-        if :charge in keys(system.data) && !iszero(system.data[:charge])
-            error("Charged systems not yet supported in DFTK.")
-        end
-        for k in (:multiplicity, )
-            if k in keys(system.data)
-                @warn "System property $k not supported and ignored in DFTK."
-            end
+    if !iszero(get(system, :charge, 0.0u"e_au"))
+        error("Charged systems not yet supported in DFTK.")
+    end
+    for k in (:multiplicity, )
+        if haskey(system, k)
+            @warn "System property $k not supported and ignored in DFTK."
         end
     end
 
@@ -93,6 +91,9 @@ function AtomsBase.atomic_system(lattice::AbstractMatrix{<:Number},
         end
         if element isa ElementPsp
             kwargs[:pseudopotential] = element.psp.identifier
+            if element.psp isa PspUpf
+                kwargs[:pseudopotential_kwargs] = (; element.psp.rcut)
+            end
         elseif element isa ElementCoulomb
             kwargs[:pseudopotential] = ""
         elseif !(element isa ElementCoulomb)
@@ -105,7 +106,8 @@ function AtomsBase.atomic_system(lattice::AbstractMatrix{<:Number},
         if atomic_symbol(element) == :X  # dummy element ... should solve this upstream
             Atom(:X, position; atomic_symbol=:X, atomic_number=0, atomic_mass=0u"u", kwargs...)
         else
-            Atom(atomic_symbol(element), position; kwargs...)
+            Atom(atomic_symbol(element), position; atomic_mass=atomic_mass(element),
+                 kwargs...)
         end
     end
     periodic_system(atomsbase_atoms, collect(eachcol(lattice)) * u"bohr")

@@ -14,7 +14,7 @@ struct Model{T <: Real, VT <: Real}
     recip_lattice::Mat3{T}
     # Dimension of the system; 3 unless `lattice` has zero columns
     n_dim::Int
-    # Useful for conversions between cartesian and reduced coordinates
+    # Useful for conversions between Cartesian and reduced coordinates
     inv_lattice::Mat3{T}
     inv_recip_lattice::Mat3{T}
     # Volumes
@@ -106,7 +106,7 @@ function Model(lattice::AbstractMatrix{T},
                terms=[Kinetic()],
                temperature=zero(T),
                smearing=temperature > 0 ? Smearing.FermiDirac() : Smearing.None(),
-               spin_polarization=default_spin_polarization(magnetic_moments),
+               spin_polarization=determine_spin_polarization(magnetic_moments),
                symmetries=default_symmetries(lattice, atoms, positions, magnetic_moments,
                                              spin_polarization, terms),
                ) where {T <: Real}
@@ -203,24 +203,51 @@ function Model(system::AbstractSystem; kwargs...)
     Model(parsed.lattice, parsed.atoms, parsed.positions; parsed.magnetic_moments, kwargs...)
 end
 
+"""
+    Model(model; [lattice, positions, atoms, kwargs...])
+    Model{T}(model; [lattice, positions, atoms, kwargs...])
+
+Construct an identical model to `model` with the option to change some of the contained
+parameters. This constructor is useful for changing the data type in the model
+or for changing `lattice` or `positions` in geometry/lattice optimisations.
+"""
+function Model{T}(model::Model;
+                  lattice::AbstractMatrix=model.lattice,
+                  positions::Vector{<:AbstractVector}=model.positions,
+                  atoms::Vector{<:Element}=model.atoms,
+                  kwargs...) where {T <: Real}
+    Model(T.(lattice), atoms, positions;
+          model.model_name,
+          model.n_electrons,
+          magnetic_moments=[],  # not used because symmetries explicitly given
+          terms=model.term_types,
+          model.temperature,
+          model.smearing,
+          model.εF,
+          model.spin_polarization,
+          model.symmetries,
+          # Can be safely disabled: this has been checked for model
+          disable_electrostatics_check=true,
+          kwargs...
+    )
+end
+function Model(model::Model{T};
+               lattice::AbstractMatrix{U}=model.lattice,
+               positions::Vector{<:AbstractVector}=model.positions,
+               kwargs...) where {T, U}
+    TT = promote_type(T, U, eltype(positions[1]))
+    Model{TT}(model; lattice, positions, kwargs...)
+end
+
+Base.convert(::Type{Model{T}}, model::Model{T}) where {T}    = model
+Base.convert(::Type{Model{U}}, model::Model{T}) where {T, U} = Model{U}(model)
+
 normalize_magnetic_moment(::Nothing)::Vec3{Float64}          = (0, 0, 0)
 normalize_magnetic_moment(mm::Number)::Vec3{Float64}         = (0, 0, mm)
 normalize_magnetic_moment(mm::AbstractVector)::Vec3{Float64} = mm
 
 """Number of valence electrons."""
 n_electrons_from_atoms(atoms) = sum(n_elec_valence, atoms; init=0)
-
-"""
-`:none` if no element has a magnetic moment, else `:collinear` or `:full`.
-"""
-function default_spin_polarization(magnetic_moments)
-    isempty(magnetic_moments) && return :none
-    all_magmoms = normalize_magnetic_moment.(magnetic_moments)
-    all(iszero, all_magmoms) && return :none
-    all(iszero(magmom[1:2]) for magmom in all_magmoms) && return :collinear
-
-    :full
-end
 
 """
 Default logic to determine the symmetry operations to be used in the model.
@@ -278,7 +305,6 @@ spin_components(model::Model) = spin_components(model.spin_polarization)
 import Base.Broadcast.broadcastable
 Base.Broadcast.broadcastable(model::Model) = Ref(model)
 
-
 #=
 There are two types of quantities, depending on how they transform under change of coordinates.
 
@@ -313,10 +339,13 @@ recip_vector_red_to_cart(model::Model, vec) = recip_vector_red_to_cart(model)(ve
 recip_vector_cart_to_red(model::Model, vec) = recip_vector_cart_to_red(model)(vec)
 
 #=
-Transformations on vectors and covectors are matrices and comatrices.
+Transformations on vectors and covectors are matrices and comatrices, i.e. matrices act on
+a vector to give a vector and comatrices act on covector to give a covector.
+Beware that some quantities (e.g., the force constant matrix) map vectors to covectors and
+are therefore not matrices nor comatrices; they fall outside of these methods.
 
 Consider two covectors f and g related by a transformation matrix B. In reduced
-coordinates g_red = B_red f_red and in cartesian coordinates we want g_cart = B_cart f_cart.
+coordinates g_red = B_red f_red and in Cartesian coordinates we want g_cart = B_cart f_cart.
 From g_cart = L⁻ᵀ g_red = L⁻ᵀ B_red f_red = L⁻ᵀ B_red Lᵀ f_cart, we see B_cart = L⁻ᵀ B_red Lᵀ.
 
 Similarly for two vectors r and s with s_red = A_red r_red and s_cart = A_cart r_cart:

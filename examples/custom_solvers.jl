@@ -1,4 +1,4 @@
-# # Custom solvers
+# # [Custom solvers](@id custom-solvers)
 # In this example, we show how to define custom solvers. Our system
 # will again be silicon, because we are not very imaginative
 using DFTK, LinearAlgebra
@@ -7,7 +7,7 @@ a = 10.26
 lattice = a / 2 * [[0 1 1.];
                    [1 0 1.];
                    [1 1 0.]]
-Si = ElementPsp(:Si, psp=load_psp("hgh/lda/Si-q4"))
+Si = ElementPsp(:Si; psp=load_psp("hgh/lda/Si-q4"))
 atoms = [Si, Si]
 positions =  [ones(3)/8, -ones(3)/8]
 
@@ -16,20 +16,24 @@ model = model_LDA(lattice, atoms, positions)
 basis = PlaneWaveBasis(model; Ecut=5, kgrid=[1, 1, 1]);
 
 # We define our custom fix-point solver: simply a damped fixed-point
-function my_fp_solver(f, x0, max_iter; tol)
+function my_fp_solver(f, x0, info0; maxiter)
     mixing_factor = .7
     x = x0
-    fx = f(x)
-    for n = 1:max_iter
-        inc = fx - x
-        if norm(inc) < tol
+    info = info0
+    for n = 1:maxiter
+        fx, info = f(x, info)
+        if info.converged || info.timedout
             break
         end
-        x = x + mixing_factor * inc
-        fx = f(x)
+        x = x + mixing_factor * (fx - x)
     end
-    (fixpoint=x, converged=norm(fx-x) < tol)
+    (; fixpoint=x, info)
 end;
+# Note that the fixpoint map `f` operates on an auxiliary variable `info` for
+# state bookkeeping. Early termination criteria are flagged from inside
+# the function `f` using boolean flags `info.converged` and `info.timedout`.
+# For control over these criteria, see the `is_converged` and `maxtime`
+# keyword arguments of `self_consistent_field`.
 
 # Our eigenvalue solver just forms the dense matrix and diagonalizes
 # it explicitly (this only works for very small systems)
@@ -39,7 +43,7 @@ function my_eig_solver(A, X0; maxiter, tol, kwargs...)
     E = eigen(A)
     λ = E.values[1:n]
     X = E.vectors[:, 1:n]
-    (; λ, X, residual_norms=[], iterations=0, converged=true, n_matvec=0)
+    (; λ, X, residual_norms=[], n_iter=0, converged=true, n_matvec=0)
 end;
 
 # Finally we also define our custom mixing scheme. It will be a mixture
@@ -64,13 +68,28 @@ end
 
 # That's it! Now we just run the SCF with these solvers
 scfres = self_consistent_field(basis;
-                               tol=1e-8,
+                               tol=1e-4,
                                solver=my_fp_solver,
                                eigensolver=my_eig_solver,
                                mixing=MyMixing());
 # Note that the default convergence criterion is the difference in
-# density. When this gets below `tol`, the
-# "driver" `self_consistent_field` artificially makes the fixed-point
-# solver think it's converged by forcing `f(x) = x`. You can customize
-# this with the `is_converged` keyword argument to
-# `self_consistent_field`.
+# density. When this gets below `tol`, the fixed-point solver terminates.
+# You can also customize this with the `is_converged` keyword argument to
+# `self_consistent_field`, as shown below.
+
+# ## Customizing the convergence criterion
+# Here is an example of a defining a custom convergence criterion and specifying
+# it using the `is_converged` callback keyword to `self_consistent_field`.
+
+function my_convergence_criterion(info)
+    tol = 1e-10
+    length(info.history_Etot) < 2 && return false
+    ΔE = (info.history_Etot[end-1] - info.history_Etot[end])
+    ΔE < tol
+end
+
+scfres2 = self_consistent_field(basis;
+                                solver=my_fp_solver,
+                                is_converged=my_convergence_criterion,
+                                eigensolver=my_eig_solver,
+                                mixing=MyMixing());
